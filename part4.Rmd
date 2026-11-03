@@ -1,0 +1,271 @@
+---
+title: "Year-over-year CPI and Brent oil changes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+required_packages <- c(
+  "dplyr", "tidyr", "ggplot2", "scales", "readr", "readxl",
+  "httr2", "imf.data"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(readr)
+library(readxl)
+library(httr2)
+library(imf.data)
+```
+
+```{r load-data, include=FALSE}
+fetch_mospi_page <- function(page) {
+  response <- httr2::request("https://api.mospi.gov.in/api/cpi/getCPIIndex") |>
+    httr2::req_url_query(
+      base_year = "2012",
+      series = "Current",
+      year = paste(2014:2025, collapse = ","),
+      month_code = paste(1:12, collapse = ","),
+      state_code = "99",
+      sector_code = "3",
+      group_code = "1,5",
+      subgroup_code = "1.99,5.99",
+      Format = "JSON",
+      limit = "200",
+      page = as.character(page)
+    ) |>
+    httr2::req_perform()
+
+  httr2::resp_body_json(response, simplifyVector = TRUE)$data
+}
+
+mospi_raw <- bind_rows(lapply(1:2, fetch_mospi_page))
+month_names <- c(
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+)
+
+india_cpi <- mospi_raw |>
+  mutate(
+    date = as.Date(sprintf("%d-%02d-01", year, match(month, month_names))),
+    country = "India",
+    component = case_when(
+      group == "Food and Beverages" ~ "Food CPI (MoSPI)",
+      group == "Fuel and Light" ~ "Energy CPI proxy (MoSPI Fuel and Light)"
+    ),
+    index = as.numeric(index)
+  ) |>
+  select(date, country, component, index)
+
+saudi_raw <- readr::read_csv(
+  "https://datapulseactive.com/data/gastat/cpi_region_monthly.csv",
+  show_col_types = FALSE
+)
+
+saudi_cpi <- saudi_raw |>
+  filter(
+    geo == "KSA",
+    activity_code %in% c("coicop_01", "coicop_04"),
+    metric == "cpi_index"
+  ) |>
+  mutate(
+    date = as.Date(paste0(date, "-01")),
+    country = "Saudi Arabia",
+    component = case_when(
+      activity_code == "coicop_01" ~ "Food CPI (GASTAT)",
+      activity_code == "coicop_04" ~ "Energy-related CPI proxy (GASTAT COICOP 04)"
+    ),
+    index = as.numeric(value)
+  ) |>
+  select(date, country, component, index)
+
+imf_raw <- imf.data::get_data(
+  "CPI",
+  filters = list(
+    COUNTRY = c("IND", "SAU"),
+    INDEX_TYPE = "CPI",
+    COICOP_1999 = "_T",
+    TYPE_OF_TRANSFORMATION = "IX",
+    FREQUENCY = "M"
+  ),
+  start_period = "2024-01",
+  end_period = "2026-11"
+)
+
+imf_headline <- imf_raw |>
+  filter(!is.na(OBS_VALUE)) |>
+  mutate(
+    date = as.Date(paste0(
+      substr(TIME_PERIOD, 1, 4), "-", substr(TIME_PERIOD, 7, 8), "-01"
+    )),
+    country = recode(COUNTRY, IND = "India", SAU = "Saudi Arabia"),
+    component = "All-items CPI (IMF)",
+    index = as.numeric(OBS_VALUE)
+  ) |>
+  select(date, country, component, index)
+
+brent <- local({
+  workbook <- tempfile(fileext = ".xlsx")
+  on.exit(unlink(workbook), add = TRUE)
+
+  download.file(
+    "https://thedocs.worldbank.org/en/doc/74e8be41ceb20fa0da750cda2f6b9e4e-0050012026/related/CMO-Historical-Data-Monthly.xlsx",
+    workbook,
+    mode = "wb",
+    quiet = TRUE
+  )
+
+  readxl::read_excel(
+    workbook,
+    sheet = "Monthly Prices",
+    range = "A7:B900",
+    col_names = FALSE,
+    .name_repair = "minimal"
+  ) |>
+    setNames(c("period", "brent_usd_bbl")) |>
+    mutate(
+      brent_usd_bbl = as.numeric(brent_usd_bbl),
+      date = as.Date(paste0(
+        substr(period, 1, 4), "-", substr(period, 6, 7), "-01"
+      ))
+    ) |>
+    filter(!is.na(date), !is.na(brent_usd_bbl)) |>
+    select(date, brent_usd_bbl)
+})
+
+cpi_index <- bind_rows(india_cpi, saudi_cpi, imf_headline) |>
+  arrange(country, component, date)
+
+cpi_yoy <- cpi_index |>
+  group_by(country, component) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(yoy_pct = 100 * (index / lag(index, 12) - 1)) |>
+  ungroup()
+
+brent_yoy <- brent |>
+  arrange(date) |>
+  mutate(brent_yoy_pct = 100 * (brent_usd_bbl / lag(brent_usd_bbl, 12) - 1))
+
+line_data <- cpi_yoy |>
+  filter(date >= as.Date("2025-01-01")) |>
+  mutate(series = paste(country, component, sep = " — ")) |>
+  select(country, date, series, yoy_pct) |>
+  bind_rows(
+    brent_yoy |>
+      filter(date >= as.Date("2025-01-01")) |>
+      crossing(country = c("India", "Saudi Arabia")) |>
+      transmute(
+        country,
+        date,
+        series = "Brent crude oil (World Bank)",
+        yoy_pct = brent_yoy_pct
+      )
+  )
+
+energy_yoy <- cpi_yoy |>
+  filter(component %in% c(
+    "Energy CPI proxy (MoSPI Fuel and Light)",
+    "Energy-related CPI proxy (GASTAT COICOP 04)"
+  )) |>
+  transmute(country, date, energy_yoy_pct = yoy_pct)
+
+regression_data <- energy_yoy |>
+  inner_join(
+    brent_yoy |> select(date, brent_yoy_pct),
+    by = "date"
+  ) |>
+  filter(
+    date >= as.Date("2015-01-01"),
+    date <= as.Date("2025-12-01"),
+    !is.na(energy_yoy_pct),
+    !is.na(brent_yoy_pct)
+  )
+
+india_model <- lm(
+  energy_yoy_pct ~ brent_yoy_pct,
+  data = filter(regression_data, country == "India")
+)
+
+saudi_model <- lm(
+  energy_yoy_pct ~ brent_yoy_pct,
+  data = filter(regression_data, country == "Saudi Arabia")
+)
+```
+
+```{r yoy-cpi-brent, echo=FALSE, fig.width=11, fig.height=8}
+ggplot(line_data, aes(x = date, y = yoy_pct, color = series)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.4) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(size = 1.5, na.rm = TRUE) +
+  facet_wrap(~country, ncol = 1) +
+  scale_x_date(
+    date_breaks = "3 months",
+    date_labels = "%b %Y",
+    limits = as.Date(c("2025-01-01", "2026-11-01"))
+  ) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(
+    title = "Year-over-year CPI and Brent oil price changes",
+    subtitle = "Monthly observations from January 2025 to the latest available month",
+    x = NULL,
+    y = "Change from the same month one year earlier",
+    color = NULL,
+    caption = paste(
+      "CPI components: MoSPI (India) and GASTAT via DataPulse (Saudi Arabia);",
+      "headline CPI: IMF; Brent: World Bank Pink Sheet."
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r saudi-regression, echo=FALSE, fig.width=8, fig.height=5}
+ggplot(
+  filter(regression_data, country == "Saudi Arabia"),
+  aes(x = brent_yoy_pct, y = energy_yoy_pct)
+) +
+  geom_point(color = "#0072B2", alpha = 0.75, size = 2) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "#D55E00", se = TRUE) +
+  labs(
+    title = "Saudi Arabia: energy-related CPI and Brent changes",
+    subtitle = paste0("OLS fit, January 2015–December 2025; n = ", nobs(saudi_model)),
+    x = "Brent price change, year over year (%)",
+    y = "Energy-related CPI change, year over year (%)",
+    caption = "CPI series: GASTAT COICOP 04, housing/water/electricity/gas and other fuels."
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+```{r india-regression, echo=FALSE, fig.width=8, fig.height=5}
+ggplot(
+  filter(regression_data, country == "India"),
+  aes(x = brent_yoy_pct, y = energy_yoy_pct)
+) +
+  geom_point(color = "#6A3D9A", alpha = 0.75, size = 2) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "#E69F00", se = TRUE) +
+  labs(
+    title = "India: fuel-and-light CPI and Brent changes",
+    subtitle = paste0("OLS fit, January 2015–December 2025; n = ", nobs(india_model)),
+    x = "Brent price change, year over year (%)",
+    y = "Fuel-and-light CPI change, year over year (%)",
+    caption = "CPI series: MoSPI Fuel and Light group, 2012 base."
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```

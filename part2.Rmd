@@ -1,0 +1,313 @@
+---
+title: "Income and wealth inequality in South Asia and the Middle East"
+output: html_document
+---
+
+<style>
+.description-box {
+  min-height: 3.5em;
+  margin: 0.5em 0 1.2em;
+  padding: 0.8em 1em;
+  border-left: 4px solid #477998;
+  background: #f4f7f9;
+}
+</style>
+
+```{r setup, include=FALSE}
+required_packages <- c(
+  "ggplot2", "sf", "rnaturalearth", "rnaturalearthdata", "dplyr",
+  "tidyr", "WDI", "ggrepel", "wid", "scales", "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(dplyr)
+library(WDI)
+library(ggrepel)
+library(wid)
+library(scales)
+library(knitr)
+```
+
+```{r country-keys}
+country_key <- tibble::tribble(
+  ~iso3c, ~wid_area, ~country_label, ~region,
+  "AFG", "AF", "Afghanistan", "South Asia",
+  "BGD", "BD", "Bangladesh", "South Asia",
+  "BTN", "BT", "Bhutan", "South Asia",
+  "IND", "IN", "India", "South Asia",
+  "MDV", "MV", "Maldives", "South Asia",
+  "NPL", "NP", "Nepal", "South Asia",
+  "PAK", "PK", "Pakistan", "South Asia",
+  "LKA", "LK", "Sri Lanka", "South Asia",
+  "BHR", "BH", "Bahrain", "Middle East",
+  "IRN", "IR", "Iran", "Middle East",
+  "IRQ", "IQ", "Iraq", "Middle East",
+  "ISR", "IL", "Israel", "Middle East",
+  "JOR", "JO", "Jordan", "Middle East",
+  "KWT", "KW", "Kuwait", "Middle East",
+  "LBN", "LB", "Lebanon", "Middle East",
+  "OMN", "OM", "Oman", "Middle East",
+  "QAT", "QA", "Qatar", "Middle East",
+  "SAU", "SA", "Saudi Arabia", "Middle East",
+  "SYR", "SY", "Syria", "Middle East",
+  "TUR", "TR", "Turkey", "Middle East",
+  "ARE", "AE", "United Arab Emirates", "Middle East",
+  "YEM", "YE", "Yemen", "Middle East",
+  "PSE", "PS", "Palestine", "Middle East"
+)
+
+selected_iso3 <- country_key$iso3c
+
+# Regional peers with both income-share and wealth-share series
+chart_areas <- c("IN", "BD", "PK", "LK", "SA", "IR", "TR", "AE")
+chart_key <- country_key |>
+  filter(wid_area %in% chart_areas) |>
+  arrange(match(wid_area, chart_areas))
+```
+
+```{r load-data}
+gini_data <- WDI(
+  country = "all",
+  indicator = c(gini = "SI.POV.GINI"),
+  start = 2000,
+  end = 2025,
+  extra = TRUE
+)
+
+gini_latest <- gini_data |>
+  filter(iso3c %in% selected_iso3, !is.na(gini)) |>
+  group_by(iso3c) |>
+  slice_max(order_by = year, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(iso3c, year, gini)
+
+world <- ne_countries(scale = "medium", returnclass = "sf") |>
+  mutate(iso3c = if_else(iso_a3 == "-99", adm0_a3, iso_a3))
+
+regional_map <- world |>
+  filter(iso3c %in% selected_iso3) |>
+  left_join(gini_latest, by = "iso3c") |>
+  left_join(country_key |> select(iso3c, country_label), by = "iso3c")
+
+wid_raw <- wid::download_wid(
+  indicators = c("sptinc", "shweal"),
+  areas = chart_areas,
+  perc = c("p0p50", "p90p100"),
+  ages = 992,
+  pop = "j"
+)
+
+wid_latest <- wid_raw |>
+  filter(
+    variable %in% c("sptinc992j", "shweal992j"),
+    percentile %in% c("p0p50", "p90p100"),
+    !is.na(value)
+  ) |>
+  distinct(country, variable, percentile, year, .keep_all = TRUE) |>
+  group_by(country, variable, year) |>
+  filter(n_distinct(percentile) == 2) |>
+  ungroup() |>
+  group_by(country, variable, percentile) |>
+  slice_max(order_by = year, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  left_join(
+    country_key |> select(wid_area, country_label, region),
+    by = c("country" = "wid_area")
+  )
+
+make_distribution <- function(variable_code) {
+  wide <- wid_latest |>
+    filter(variable == variable_code) |>
+    select(country, country_label, year, percentile, value) |>
+    tidyr::pivot_wider(names_from = percentile, values_from = value) |>
+    filter(!is.na(p0p50), !is.na(p90p100)) |>
+    mutate(
+      bottom50 = 100 * p0p50,
+      top10 = 100 * p90p100,
+      middle40 = 100 - bottom50 - top10
+    ) |>
+    arrange(top10)
+
+  country_levels <- wide$country_label
+
+  wide |>
+    mutate(country_label = factor(country_label, levels = country_levels)) |>
+    tidyr::pivot_longer(
+      cols = c(bottom50, middle40, top10),
+      names_to = "segment",
+      values_to = "share"
+    ) |>
+    mutate(
+      segment = recode(
+        segment,
+        bottom50 = "Bottom 50%",
+        middle40 = "Middle 40%",
+        top10 = "Top 10%"
+      ),
+      segment = factor(
+        segment,
+        levels = c("Bottom 50%", "Middle 40%", "Top 10%")
+      )
+    )
+}
+
+plot_distribution <- function(data, title, subtitle, highlight_colors, caption) {
+  highlight_points <- data |>
+    filter(as.character(country_label) %in% c("India", "Saudi Arabia")) |>
+    distinct(country_label) |>
+    mutate(highlight = as.character(country_label))
+
+  ggplot(data, aes(x = share, y = country_label, fill = segment, group = segment)) +
+    geom_col(
+      position = position_stack(reverse = TRUE),
+      width = 0.72,
+      color = "white",
+      linewidth = 0.4
+    ) +
+    geom_text(
+      aes(label = sprintf("%.0f%%", share)),
+      position = position_stack(vjust = 0.5, reverse = TRUE),
+      color = "#222222",
+      size = 3,
+      fontface = "bold"
+    ) +
+    geom_point(
+      data = highlight_points,
+      aes(x = -3, y = country_label, color = highlight),
+      inherit.aes = FALSE,
+      shape = 15,
+      size = 3.5
+    ) +
+    scale_x_continuous(
+      limits = c(-5, 100),
+      breaks = seq(0, 100, 20),
+      labels = label_percent(scale = 1, accuracy = 1),
+      expand = expansion(mult = 0)
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Bottom 50%" = "#F6E8A8",
+        "Middle 40%" = "#F2B83F",
+        "Top 10%" = "#B28620"
+      )
+    ) +
+    scale_color_manual(values = highlight_colors, name = "Highlighted country") +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Share of total",
+      y = NULL,
+      fill = "Population group",
+      caption = caption
+    ) +
+    guides(
+      fill = guide_legend(order = 1),
+      color = guide_legend(order = 2, override.aes = list(shape = 15, size = 4))
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 15, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major.y = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.y = element_text(color = "#202833")
+    )
+}
+
+income_distribution <- make_distribution("sptinc992j")
+wealth_distribution <- make_distribution("shweal992j")
+```
+
+## 1. Country-level Gini coefficients
+
+<div class="description-box">
+</div>
+
+```{r gini-map, fig.width=11, fig.height=7}
+label_points <- st_point_on_surface(regional_map)
+label_coordinates <- st_coordinates(label_points)
+
+country_labels <- label_points |>
+  mutate(
+    lon = label_coordinates[, 1],
+    lat = label_coordinates[, 2],
+    label = if_else(is.na(gini), "NA", sprintf("%.1f", gini))
+  ) |>
+  st_drop_geometry()
+
+ggplot(regional_map) +
+  geom_sf(aes(fill = gini), color = "white", linewidth = 0.35) +
+  geom_text_repel(
+    data = country_labels,
+    aes(x = lon, y = lat, label = label),
+    size = 3,
+    fontface = "bold",
+    color = "black",
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    seed = 6843
+  ) +
+  scale_fill_gradientn(
+    colours = c("#2166AC", "#67A9CF", "#F7F7F7", "#EF8A62", "#B2182B"),
+    name = "Gini coefficient",
+    na.value = "grey80"
+  ) +
+  coord_sf(crs = st_crs(4326), expand = FALSE) +
+  labs(
+    title = "Income inequality in South Asia and the Middle East",
+    subtitle = "Latest available country-level Gini observation, 2000–2025",
+    caption = "Source: World Bank, indicator SI.POV.GINI. Grey indicates unavailable data."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+```
+
+## 2. Income distribution
+
+<div class="description-box">
+</div>
+
+```{r income-shares, fig.width=10, fig.height=6}
+plot_distribution(
+  income_distribution,
+  title = "Share of pre-tax national income",
+  subtitle = "Bottom 50%, middle 40%, and top 10%",
+  highlight_colors = c("India" = "#007F86", "Saudi Arabia" = "#D1495B"),
+  caption = "Source: World Inequality Database (WID.world). Markers highlight India and Saudi Arabia."
+)
+```
+
+## 3. Wealth distribution
+
+<div class="description-box">
+</div>
+
+```{r wealth-shares, fig.width=10, fig.height=6}
+plot_distribution(
+  wealth_distribution,
+  title = "Share of net personal wealth",
+  subtitle = "Bottom 50%, middle 40%, and top 10%",
+  highlight_colors = c("India" = "#6A3D9A", "Saudi Arabia" = "#0072B2"),
+  caption = "Source: World Inequality Database (WID.world). Markers highlight India and Saudi Arabia."
+)
+```
