@@ -11,6 +11,7 @@ library(tidyverse)
 library(wid)
 library(ggplot2)
 library(patchwork)
+country_colours <- c("India" = "#1f77b4", "Saudi Arabia" = "#2ca02c")
 
 # original test with WDI
 
@@ -88,3 +89,42 @@ combined <- (plotted + p9010_plot) +
   theme(legend.position = "bottom")
 
 combined
+
+# Wealth inequality: top 10% share of net personal wealth
+
+wealth_wid <- download_wid(
+  indicators = "shweal",     # share of net personal wealth
+  areas      = c("IN", "SA"),
+  perc       = "p90p100",    # top 10%
+  ages       = "992",        # adults
+  pop        = "j"           # equal-split, same as income measures
+) %>%
+  mutate(country = recode(country, "IN" = "India", "SA" = "Saudi Arabia")) %>%
+  select(country, year, top10_wealth = value) %>%
+  filter(year >= 1980) %>%
+  arrange(country, year)
+
+view(wealth_wid)
+
+# Plotting
+
+wealth_plot <- ggplot(wealth_wid, aes(year, top10_wealth, colour = country)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_manual(values = country_colours) +
+  labs(title = "Top 10% wealth share", x = "Year", y = "Share of total wealth",
+       colour = NULL, caption = "Source: World Inequality Database") +
+  theme_minimal()
+
+wealth_plot
+
+# All three inequality measures side by side
+
+(plotted + wealth_plot) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Income and wealth inequality: India vs Saudi Arabia",
+                  caption = "Source: World Inequality Database") &
+  theme(legend.position = "bottom")
+
+ggsave("inequality_part1.png", width = 14, height = 5, dpi = 300)
+
