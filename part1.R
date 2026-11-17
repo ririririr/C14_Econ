@@ -126,5 +126,5 @@ wealth_plot
                   caption = "Source: World Inequality Database") &
   theme(legend.position = "bottom")
 
-ggsave("inequality_part1.png", width = 14, height = 5, dpi = 300)
+  ggsave("inequality_part1.png", width = 14, height = 5, dpi = 300)
 

@@ -85,6 +85,10 @@ cor_results <- df %>%
                           top10_wealth_lag = "Top 10% wealth share")) %>%
   select(-test)
 
+
+#As income gini doesnt have data for Saudi Arabia employed the use of p90/p10 which i found in part 1 but didnt presnt so theres correlation data for both saudi and india.
+
+
 cor_results   # table to put in your write-up
 
 ggplot(cor_results, aes(x = r, y = measure, colour = country)) +
@@ -144,3 +148,10 @@ view(both_results)
 
 
 #Something like Spearmens results are significant for India so some other factors could be driving the correlation down in pearsons test like the 1991 economic crash.
+
+#Using Spearmens this correaltion methos is alot less sensitive to outliers in the data for example in 1991 indias economic crash may have skewed
+#The correlation data in Pearsons method however using Spearmans method this shows that the p value for correlation for gini coefficent to growth rate is significant
+#p = 0.004 which is below the 5% level
+#so Strong evidence income inequality is moderatly related to income growth for India
+#for Saudia Arabia, both correlation methods collect p values way above 0.05 so no evidence that theirs a relationship and too weak to rule one out either
+#Things like Oil drive Saudia Arbias GDP p.c growth so this changes more with global markets rather than domestic inequality.
